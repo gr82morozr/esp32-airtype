@@ -10,7 +10,8 @@ accepts text or base64 payloads over a TCP console (`9000`) to type on the host.
   keyboard; otherwise the console is read-only for logging.
 - LED states describe status (see below for details).
 - OTA is enabled after Wi-Fi connects (hostname `esp32-airtype.local`).
-- Mouse joggle runs every 3 minutes to keep the host awake.
+- Mouse joggle runs every 3 minutes to keep the host awake (acts as a simple
+  mouse jiggler even if you never stream data).
 
 ## When to use it
 
@@ -43,6 +44,12 @@ it is suitable for small transfers, not bulk data exfiltration.
   100 chars/second cap (`--rate` overrides; `0` disables).
 - On-device, `KEYBOARD_MIN_INTERVAL_MS` enforces a ~100 chars/second floor
   between HID key events to match the sender cap.
+
+## Mouse jiggler
+
+- Automatically nudges the mouse cursor in a small square every 3 minutes to
+  prevent sleep/lock; see `MOUSE_WAKE_INTERVAL_MS` in `src/main.cpp` to change
+  the interval.
 
 ## Usage
 
