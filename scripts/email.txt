@@ -1,0 +1,8 @@
+Just to clarify how we’re using these error codes:
+1 - WSxxxxx codes are internal to Siebel and are created by developers at build time. 
+They are lookup keys for validation messages and are never exposed to any external systems. Because of that, including them in design or interface contract documents only adds maintenance effort without any real benefit. These values should be determined by developers, not fixed in the design docs.
+2 - DSS-xxxxx codes are exposed to FMW and form part of the interface design.
+The proposed approach is:
+In all design and interface contract documents, only DSS-xxxxx error codes are documented.
+WSxxxxx codes are excluded entirely from design and interface documentation.
+This will make the process simpler, no confusion, and avoid unnecessary updates when internal WS codes change.
