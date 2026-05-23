@@ -1,0 +1,55 @@
+Mode behavior
+=============
+
+Button pressed: INPUT mode
+--------------------------
+- This mode is valid at any time, regardless of jitter active hours.
+- Wi-Fi must be enabled. If Wi-Fi is not connected, the device starts or
+  continues connecting.
+- While Wi-Fi is connecting, the RGB LED blinks red/blue.
+- Once Wi-Fi is connected, the RGB LED is solid green while idle and blinks
+  green at 10 Hz during TCP data transfer.
+- Incoming TCP data is sent to USB as HID keyboard input.
+- Mouse jitter is disabled and no mouse HID movement is sent.
+
+
+Button released: jitter mode
+----------------------------
+- Jitter active hours are 08:00 to 17:00, Monday to Friday, using
+  Australia/Sydney local time with daylight saving.
+- If local time is not available yet, Wi-Fi stays enabled and the RGB LED blinks
+  red/blue until time sync determines whether jitter mode is active or inactive.
+
+Outside jitter active hours:
+- Wi-Fi stays enabled and connected when possible.
+- The RGB LED is off.
+- No keyboard HID input is sent.
+- No mouse HID movement is sent.
+- The device stays enumerated as a USB HID device.
+- The firmware idles with Wi-Fi modem sleep and a slower loop to save power.
+- The device automatically switches to active jitter mode at the next
+  jitter active-hours start.
+- Pressing the button switches immediately to INPUT mode.
+
+Inside jitter active hours:
+- Wi-Fi must be enabled and connected when possible.
+- While Wi-Fi is connecting, the RGB LED blinks red/blue.
+- Once Wi-Fi is connected, the RGB LED shows the RGB breathing pattern.
+- Mouse jitter is sent as USB HID mouse movement every 3 minutes.
+- Pressing the button switches immediately to INPUT mode.
+
+
+OTA update
+----------
+- OTA overrides all normal mode LED behavior.
+- During OTA, the RGB LED blinks sharply between full blue and off.
+- The blink frequency is based on OTA progress percentage.
+
+
+
+
+Time sync
+---------
+- Use an external internet time source to maintain Australia/Sydney local time.
+- Sync time every 1 hour while Wi-Fi is on.
+- Outside jitter active hours, Wi-Fi stays on so time sync can continue.

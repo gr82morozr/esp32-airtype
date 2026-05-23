@@ -22,6 +22,22 @@ DEFAULT_BURST = 32
 DEFAULT_RATE = 100.0
 READY_POLL_INTERVAL = 0.1
 READY_STATUS_INTERVAL = 2.0
+FINAL_ACK_TIMEOUT = 30.0
+FILE_END_CONTROL_PREFIX = b"\x1eEND "
+RATE_CONTROL_PREFIX = b"\x1eRATE "
+ANSI_RED = "\033[31m"
+ANSI_RESET = "\033[0m"
+
+
+def _red(text: str) -> str:
+  return f"{ANSI_RED}{text}{ANSI_RESET}"
+
+
+def _pause_on_mismatch() -> None:
+  try:
+    input("[sender] Press Enter to exit...")
+  except EOFError:
+    pass
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -72,11 +88,12 @@ def build_parser() -> argparse.ArgumentParser:
       ),
   )
   parser.add_argument(
+      "-rate",
       "--rate",
       type=float,
       default=DEFAULT_RATE,
       help=(
-          "Maximum characters per second (0 to disable rate cap, default: "
+          "Keyboard typing rate in characters per second (default: "
           "%(default)s)"
       ),
   )
@@ -126,6 +143,15 @@ def _build_end_marker(path: Path) -> bytes:
   return marker.encode("ascii")
 
 
+def _build_file_end_control(total_chars: int) -> bytes:
+  return FILE_END_CONTROL_PREFIX + str(total_chars).encode("ascii") + b"\n"
+
+
+def _build_rate_control(rate: float) -> bytes:
+  rate_cps = max(1, int(round(rate)))
+  return RATE_CONTROL_PREFIX + str(rate_cps).encode("ascii") + b"\n"
+
+
 def _expand_inputs(inputs: list[Path]) -> list[Path]:
   files: list[Path] = []
   for input_path in inputs:
@@ -148,10 +174,25 @@ def _drain_ready_state(
     pending: str,
     ready: bool,
     saw_state: bool,
-) -> tuple[str, bool, bool]:
+    accepted_ack: int,
+    typed_ack: int,
+    buffer_free: int,
+    finished_typed: int,
+    file_done_typed: int,
+    file_done_expected: int,
+    file_done_seen: bool,
+    rate_ack_cps: int,
+    rate_ack_seen: bool,
+) -> tuple[str, bool, bool, int, int, int, int, int, int, bool, int, bool]:
   """Read newline-delimited readiness state from the receiver.
 
   `1` means ready to accept input, `0` means wait.
+  `E <n>` means the receiver has accepted n payload characters into RAM.
+  `A <n>` means the receiver has typed n payload characters.
+  `B <n>` means the receiver has n free bytes in its input buffer.
+  `F <n>` means the receiver's input buffer drained after typing n characters.
+  `D <typed> <expected>` means the receiver finished this file.
+  `R <cps> <interval_us>` means the receiver applied the typing rate.
   """
   while True:
     readable, _, _ = select.select([sock], [], [], 0)
@@ -176,7 +217,57 @@ def _drain_ready_state(
           print("[sender] Receiver not in input mode. Waiting...")
         ready = False
         saw_state = True
-  return pending, ready, saw_state
+      elif line.startswith("A "):
+        try:
+          typed_ack = max(typed_ack, int(line.split(maxsplit=1)[1]))
+        except ValueError:
+          pass
+      elif line.startswith("E "):
+        try:
+          accepted_ack = max(accepted_ack, int(line.split(maxsplit=1)[1]))
+        except ValueError:
+          pass
+      elif line.startswith("B "):
+        try:
+          buffer_free = max(0, int(line.split(maxsplit=1)[1]))
+        except ValueError:
+          pass
+      elif line.startswith("F "):
+        try:
+          finished_typed = max(finished_typed, int(line.split(maxsplit=1)[1]))
+        except ValueError:
+          pass
+      elif line.startswith("D "):
+        parts = line.split()
+        if len(parts) == 3:
+          try:
+            file_done_typed = int(parts[1])
+            file_done_expected = int(parts[2])
+            file_done_seen = True
+          except ValueError:
+            pass
+      elif line.startswith("R "):
+        parts = line.split()
+        if len(parts) >= 2:
+          try:
+            rate_ack_cps = int(parts[1])
+            rate_ack_seen = True
+          except ValueError:
+            pass
+  return (
+      pending,
+      ready,
+      saw_state,
+      accepted_ack,
+      typed_ack,
+      buffer_free,
+      finished_typed,
+      file_done_typed,
+      file_done_expected,
+      file_done_seen,
+      rate_ack_cps,
+      rate_ack_seen,
+  )
 
 
 def stream_forever(
@@ -193,8 +284,15 @@ def stream_forever(
 ) -> None:
   """Open a TCP connection and stream payload bytes."""
   total_chars = len(payload)
+  file_end_control = _build_file_end_control(total_chars)
+  rate_control = _build_rate_control(rate)
+  requested_rate_cps = max(1, int(round(rate)))
+  progress_width = 0
   while not stop_flag.is_set:
     sock: Optional[socket.socket] = None
+    index = 0
+    accepted_ack = 0
+    typed_ack = 0
     try:
       print(f"[sender] Connecting to {host}:{port} ...")
       sock = socket.create_connection((host, port), timeout=connect_timeout)
@@ -209,15 +307,134 @@ def stream_forever(
       pending_state = ""
       receiver_ready = False
       saw_ready_state = False
+      accepted_ack = 0
+      typed_ack = 0
+      buffer_free = 0
+      finished_typed = 0
+      file_end_sent = False
+      file_done_typed = 0
+      file_done_expected = 0
+      file_done_seen = False
+      rate_control_sent = False
+      rate_ack_cps = 0
+      rate_ack_seen = False
+      file_end_sent_at: Optional[float] = None
       last_waiting_status = 0.0
+      last_rate_sample_time = time.monotonic()
+      last_rate_sample_typed = 0
+      measured_typed_rate = 0.0
       while not stop_flag.is_set:
-        pending_state, receiver_ready, saw_ready_state = _drain_ready_state(
-            sock, pending_state, receiver_ready, saw_ready_state)
-        if index >= total_chars:
-          sys.stdout.write(f"\r[sender] {label}: 100.00%\n")
+        (
+            pending_state,
+            receiver_ready,
+            saw_ready_state,
+            accepted_ack,
+            typed_ack,
+            buffer_free,
+            finished_typed,
+            file_done_typed,
+            file_done_expected,
+            file_done_seen,
+            rate_ack_cps,
+            rate_ack_seen,
+        ) = _drain_ready_state(
+            sock,
+            pending_state,
+            receiver_ready,
+            saw_ready_state,
+            accepted_ack,
+            typed_ack,
+            buffer_free,
+            finished_typed,
+            file_done_typed,
+            file_done_expected,
+            file_done_seen,
+            rate_ack_cps,
+            rate_ack_seen,
+        )
+        now = time.monotonic()
+        if now - last_rate_sample_time >= 1.0:
+          typed_delta = typed_ack - last_rate_sample_typed
+          time_delta = now - last_rate_sample_time
+          if time_delta > 0:
+            measured_typed_rate = typed_delta / time_delta
+          last_rate_sample_typed = typed_ack
+          last_rate_sample_time = now
+        if receiver_ready and not rate_control_sent:
+          sock.sendall(rate_control)
+          rate_control_sent = True
+          rate_ack_cps = 0
+          rate_ack_seen = False
+        if rate_control_sent and not rate_ack_seen:
+          _sleep_with_stop(READY_POLL_INTERVAL, stop_flag)
+          continue
+        if rate_ack_seen and rate_ack_cps != requested_rate_cps:
+          print()
+          print(_red(
+              f"[sender] ESP32 applied typing rate {rate_ack_cps} cps, "
+              f"but sender requested {requested_rate_cps} cps."
+          ))
+          _pause_on_mismatch()
+          stop_flag.set()
+          return
+        if index >= total_chars and not file_end_sent:
+          sock.sendall(file_end_control)
+          file_end_sent = True
+          remaining_chars = max(0, total_chars - typed_ack)
+          drain_seconds = remaining_chars / max(1.0, float(rate_ack_cps or requested_rate_cps))
+          file_end_sent_at = time.monotonic() + max(FINAL_ACK_TIMEOUT, drain_seconds * 2.0 + 10.0)
+        if file_end_sent and finished_typed >= total_chars and file_done_seen:
+          clear = " " * max(0, progress_width)
+          sys.stdout.write(f"\r{clear}\r")
           sys.stdout.flush()
+          sent_ok = index == total_chars
+          accepted_ok = accepted_ack == total_chars
+          typed_ok = typed_ack == total_chars
+          buffer_done_ok = finished_typed == total_chars
+          file_done_ok = (
+              file_done_typed == total_chars and file_done_expected == total_chars
+          )
+          ok = sent_ok and accepted_ok and typed_ok and buffer_done_ok and file_done_ok
+          status = "OK" if ok else _red("MISMATCH")
+          print(
+              f"[sender] Result for {label}: {status} "
+              f"sent={index}/{total_chars}, "
+              f"accepted={accepted_ack}/{total_chars}, "
+              f"typed={typed_ack}/{total_chars}, "
+              f"buffer_done={finished_typed}/{total_chars}, "
+              f"file_done={file_done_typed}/{file_done_expected}"
+          )
+          if not ok:
+            print(_red("[sender] Transfer counts do not match. Leaving console paused."))
+            _pause_on_mismatch()
+            stop_flag.set()
           print(f"[sender] Finished sending {label}.")
           return
+        if file_end_sent_at is not None and time.monotonic() > file_end_sent_at:
+          print()
+          print(_red(
+              f"[sender] Timed out waiting for final ACKs for {label}: "
+              f"sent={index}/{total_chars}, accepted={accepted_ack}/{total_chars}, "
+              f"typed={typed_ack}/{total_chars}, buffer_done={finished_typed}/{total_chars}, "
+              f"file_done={file_done_typed}/{file_done_expected}"
+          ))
+          _pause_on_mismatch()
+          stop_flag.set()
+          return
+        if index >= total_chars:
+          progress = (
+              f"[sender] {label}: 100.00% sent, "
+              f"{(accepted_ack / total_chars) * 100.0:6.2f}% buffered, "
+              f"{(typed_ack / total_chars) * 100.0:6.2f}% typed, "
+              f"rate {measured_typed_rate:6.1f}/{rate_ack_cps or requested_rate_cps} cps, "
+              f"waiting buffer/file finish {finished_typed}/{total_chars}, "
+              f"{file_done_typed}/{total_chars}"
+          )
+          progress_width = max(progress_width, len(progress))
+          sys.stdout.write(f"\r{progress:<{progress_width}}")
+          sys.stdout.flush()
+          _sleep_with_stop(READY_POLL_INTERVAL, stop_flag)
+          continue
         if not receiver_ready:
           now = time.monotonic()
           if not saw_ready_state and now - last_waiting_status >= READY_STATUS_INTERVAL:
@@ -232,12 +449,24 @@ def stream_forever(
         if now < next_send:
           _sleep_with_stop(min(0.01, next_send - now), stop_flag)
           continue
-        send_count = min(burst, total_chars - index)
+        receiver_buffered = max(0, index - accepted_ack)
+        send_window = max(0, buffer_free - receiver_buffered)
+        if send_window <= 0:
+          _sleep_with_stop(READY_POLL_INTERVAL, stop_flag)
+          continue
+        send_count = min(burst, send_window, total_chars - index)
         chunk = payload[index:index + send_count]
         index += send_count
         sock.sendall(chunk)
         percent = (index / total_chars) * 100.0
-        sys.stdout.write(f"\r[sender] {label}: {percent:6.2f}%")
+        progress = (
+            f"\r[sender] {label}: {percent:6.2f}% sent, "
+            f"{(accepted_ack / total_chars) * 100.0:6.2f}% buffered, "
+            f"{(typed_ack / total_chars) * 100.0:6.2f}% typed, "
+            f"rate {measured_typed_rate:6.1f}/{rate_ack_cps or requested_rate_cps} cps"
+        )
+        progress_width = max(progress_width, len(progress) - 1)
+        sys.stdout.write(f"{progress:<{progress_width + 1}}")
         sys.stdout.flush()
         delay = interval if interval > 0 else 0.0
         if rate > 0:
@@ -249,6 +478,19 @@ def stream_forever(
     except (ConnectionError, OSError) as exc:
       if stop_flag.is_set:
         break
+      if index > 0 or accepted_ack > 0 or typed_ack > 0:
+        print()
+        print(_red(
+            f"[sender] Socket error after transfer started for {label}: {exc!r}. "
+            "Not retrying because that could duplicate already-typed characters."
+        ))
+        print(_red(
+            f"[sender] Last counts: sent={index}/{total_chars}, "
+            f"accepted={accepted_ack}/{total_chars}, typed={typed_ack}/{total_chars}"
+        ))
+        _pause_on_mismatch()
+        stop_flag.set()
+        return
       print(
           f"[sender] Socket error: {exc!r}. Retrying in {RECONNECT_DELAY:.0f} seconds..."
       )

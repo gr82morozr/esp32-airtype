@@ -11,5 +11,7 @@
     "statusBar.debuggingForeground": "#E9FEFE",
     "statusBar.noFolderBackground": "#033333",
     "statusBar.noFolderForeground": "#E9FEFE"
-  }
+  },
+  "python-envs.defaultEnvManager": "ms-python.python:conda",
+  "python-envs.defaultPackageManager": "ms-python.python:conda"
 }
