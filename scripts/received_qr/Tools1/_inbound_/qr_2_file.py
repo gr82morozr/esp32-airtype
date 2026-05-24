@@ -41,8 +41,6 @@ SPACE_TYPE_SETTLE_MS = 80
 MIN_CAMERA_WIDTH = 800
 MIN_CAMERA_HEIGHT = 450
 HEAVY_PASS_INTERVAL = 6
-HEAVY_PASS_MISS_THRESHOLD = 3
-STATUS_POLL_INTERVAL = 0.25
 CYAN_LOW = np.array([78, 110, 110], dtype=np.uint8)
 CYAN_HIGH = np.array([102, 255, 255], dtype=np.uint8)
 
@@ -60,16 +58,6 @@ class TransferBuffer:
 
 
 @dataclass
-class SessionState:
-    expected_files: int = 0
-    started_files: set[str] = field(default_factory=set)
-    completed_files: set[str] = field(default_factory=set)
-    session_end_seen: bool = False
-    session_end_repeat_total: int = 0
-    session_end_repeats_seen: set[int] = field(default_factory=set)
-
-
-@dataclass
 class SpaceSender:
     host: str
     port: int
@@ -79,7 +67,6 @@ class SpaceSender:
     ready: Optional[bool] = None
     last_error: str = ""
     last_prompt_at: float = 0.0
-    last_status_poll: float = 0.0
 
     def close(self) -> None:
         if self.sock is not None:
@@ -101,18 +88,6 @@ class SpaceSender:
         self.pending = ""
         self.ready = None
 
-    def ensure_connected(self) -> bool:
-        if self.sock is not None:
-            return True
-        try:
-            self._connect()
-            self.last_error = ""
-            return True
-        except OSError:
-            self.last_error = f"TCP connect/status failed to {self.host}:{self.port}"
-            self.close()
-            return False
-
     def _drain_state(self) -> None:
         if self.sock is None:
             return
@@ -132,18 +107,14 @@ class SpaceSender:
                 elif line == "0":
                     self.ready = False
 
-    def refresh_ready(self, force: bool = False) -> bool:
-        now = time.monotonic()
-        if not force and self.ready is not None and now - self.last_status_poll < STATUS_POLL_INTERVAL:
-            return self.ready is True
-        if not self.ensure_connected():
-            return False
+    def refresh_ready(self) -> bool:
+        self.close()
         try:
+            self._connect()
             deadline = time.monotonic() + self.connect_timeout
             while time.monotonic() < deadline:
                 self._drain_state()
                 if self.ready is not None:
-                    self.last_status_poll = time.monotonic()
                     self.last_error = ""
                     return self.ready is True
                 time.sleep(0.05)
@@ -169,7 +140,7 @@ class SpaceSender:
 
     def send_space(self) -> bool:
         try:
-            if not self.refresh_ready(force=True):
+            if not self.refresh_ready():
                 if self.last_error == "":
                     self.last_error = "ESP32 not in INPUT mode"
                 return False
@@ -329,75 +300,19 @@ def process_protocol_message(
     output_dir: Path,
     transfers: dict[tuple[str, str], TransferBuffer],
     completed: set[tuple[str, str]],
-    sessions: dict[str, SessionState],
 ) -> Optional[str]:
-    def active_transfer_count(current_session_id: str) -> int:
-        return sum(1 for sid, _fid in transfers.keys() if sid == current_session_id)
-
     frame_type = str(message.get("t", ""))
     session_id = str(message.get("s", ""))
     file_id = str(message.get("f", ""))
 
     if frame_type == "session_end":
-        if not session_id:
-            return None
-        session = sessions.setdefault(session_id, SessionState())
-        try:
-            session.expected_files = max(session.expected_files, int(message.get("c", 0)))
-        except (TypeError, ValueError):
-            pass
-        try:
-            repeat_index = int(message.get("ri", 0))
-        except (TypeError, ValueError):
-            repeat_index = 0
-        try:
-            repeat_total = int(message.get("rc", 0))
-        except (TypeError, ValueError):
-            repeat_total = 0
-        if repeat_total > 0:
-            session.session_end_repeat_total = max(session.session_end_repeat_total, repeat_total)
-        if repeat_index > 0:
-            session.session_end_repeats_seen.add(repeat_index)
-        required_repeats = 1
-        if session.session_end_repeat_total >= 2:
-            required_repeats = 2
-        session.session_end_seen = len(session.session_end_repeats_seen) >= required_repeats
-        completed_count = len(session.completed_files)
-        started_count = len(session.started_files)
-        active_count = active_transfer_count(session_id)
-        if (
-            session.session_end_seen
-            and
-            session.expected_files > 0
-            and completed_count >= session.expected_files
-            and started_count >= session.expected_files
-            and active_count == 0
-        ):
-            return (
-                f"Session complete: {session_id} "
-                f"({completed_count}/{session.expected_files} files)"
-            )
-        if session.expected_files > 0:
-            session_end_status = (
-                f"session_end {len(session.session_end_repeats_seen)}/{session.session_end_repeat_total}"
-                if session.session_end_repeat_total > 0
-                else "session_end pending"
-            )
-            return (
-                f"Session end seen for {session_id}, waiting for files "
-                f"(started {started_count}/{session.expected_files}, "
-                f"complete {completed_count}/{session.expected_files}, "
-                f"active {active_count}, {session_end_status})"
-            )
-        return f"Session end seen for {session_id}"
+        return f"Session complete: {session_id}"
     if not session_id or not file_id:
         return None
 
-    session = sessions.setdefault(session_id, SessionState())
     key = (session_id, file_id)
     if frame_type == "start":
         buffer = get_buffer(transfers, session_id, file_id)
-        session.started_files.add(file_id)
         path = str(message.get("p", buffer.relative_path))
         encoding = str(message.get("e", buffer.encoding))
         expected_chunks = int(message.get("c", buffer.expected_chunks or 0))
@@ -454,27 +369,7 @@ def process_protocol_message(
         except ValueError as exc:
             return str(exc)
         completed.add(key)
-        session.completed_files.add(file_id)
         del transfers[key]
-        if session.session_end_seen and session.expected_files > 0:
-            completed_count = len(session.completed_files)
-            started_count = len(session.started_files)
-            active_count = active_transfer_count(session_id)
-            if (
-                completed_count >= session.expected_files
-                and started_count >= session.expected_files
-                and active_count == 0
-            ):
-                return (
-                    f"{result} | Session complete: {session_id} "
-                    f"({completed_count}/{session.expected_files} files)"
-                )
-            return (
-                f"{result} | Waiting for more files in session {session_id} "
-                f"(started {started_count}/{session.expected_files}, "
-                f"complete {completed_count}/{session.expected_files}, "
-                f"active {active_count})"
-            )
         return result
 
     return None
@@ -820,7 +715,6 @@ def decode_warped_candidates(
     frame: "cv2.Mat",
     boxes: list[list[int]],
     detector: "cv2.QRCodeDetector",
-    allow_pyzbar: bool,
 ) -> list[tuple[str, list[int]]]:
     results: list[tuple[str, list[int]]] = []
     for pts in boxes[:3]:
@@ -841,7 +735,7 @@ def decode_warped_candidates(
             for rotate in rotations:
                 rotated = rotate(variant)
                 decoded = decode_with_opencv(rotated, detector)
-                if allow_pyzbar and pyzbar_decode is not None:
+                if pyzbar_decode is not None:
                     decoded.extend(decode_with_pyzbar(rotated))
                 if decoded:
                     results.extend(decoded)
@@ -854,7 +748,6 @@ def decode_roi_candidates(
     quick_gray: "cv2.Mat",
     boxes: list[list[int]],
     detector: "cv2.QRCodeDetector",
-    allow_pyzbar: bool,
 ) -> list[tuple[str, list[int]]]:
     results: list[tuple[str, list[int]]] = []
     for pts in boxes[:4]:
@@ -866,7 +759,7 @@ def decode_roi_candidates(
             variants = [gray_roi, sharpen_frame(gray_roi), threshold_frame(gray_roi)]
             for variant in variants:
                 decoded = decode_with_opencv(variant, detector)
-                if allow_pyzbar and pyzbar_decode is not None:
+                if pyzbar_decode is not None:
                     decoded.extend(decode_with_pyzbar(variant))
                 if decoded:
                     results.extend(decoded)
@@ -910,8 +803,8 @@ def detect_qr(
             if pyzbar_decode is not None:
                 roi_heavy.extend(decode_with_pyzbar(roi_sharp))
                 roi_heavy.extend(decode_with_pyzbar(roi_thresh))
-            roi_heavy.extend(decode_roi_candidates(roi_frame, roi_quick_gray, roi_boxes, detector, allow_pyzbar=True))
-            roi_heavy.extend(decode_warped_candidates(roi_frame, roi_boxes, detector, allow_pyzbar=True))
+            roi_heavy.extend(decode_roi_candidates(roi_frame, roi_quick_gray, roi_boxes, detector))
+            roi_heavy.extend(decode_warped_candidates(roi_frame, roi_boxes, detector))
             roi_payloads = merge_payloads(roi_candidates + roi_heavy)
             if roi_payloads:
                 return roi_payloads, [roi_box]
@@ -941,8 +834,8 @@ def detect_qr(
         for quad in contour_boxes:
             if tuple(quad) not in existing:
                 detect_boxes.append(quad)
-    heavy_candidates.extend(decode_roi_candidates(frame, quick_gray, detect_boxes, detector, allow_pyzbar=True))
-    heavy_candidates.extend(decode_warped_candidates(frame, detect_boxes, detector, allow_pyzbar=True))
+    heavy_candidates.extend(decode_roi_candidates(frame, quick_gray, detect_boxes, detector))
+    heavy_candidates.extend(decode_warped_candidates(frame, detect_boxes, detector))
     if not heavy_candidates:
         heavy_candidates.extend(decode_with_opencv(sharp_thresh, detector))
         if pyzbar_decode is not None:
@@ -954,7 +847,7 @@ def detect_qr(
 
 
 def read_latest_frame(cap: "cv2.VideoCapture") -> tuple[bool, Optional["cv2.Mat"]]:
-    for _ in range(2):
+    for _ in range(4):
         try:
             if not cap.grab():
                 break
@@ -1031,16 +924,13 @@ def main() -> None:
     try:
         cap = open_camera(args.camera)
         space_sender = SpaceSender(DEFAULT_ESP32_HOST, args.esp32_port, args.connect_timeout)
-        print(f"Opening camera #{args.camera}. Press Ctrl-C to quit.")
+        print(f"Opening camera #{args.camera}. Press ESC or Q to quit.")
         seen: Set[str] = set()
         last_seen: dict[str, float] = {}
-        processed_page_ids: set[str] = set()
         transfers: dict[tuple[str, str], TransferBuffer] = {}
         completed: set[tuple[str, str]] = set()
-        sessions: dict[str, SessionState] = {}
         frame_count = 0
         repeat_delay = 2.0
-        consecutive_misses = 0
         args.output.mkdir(parents=True, exist_ok=True)
 
         while not stop_requested:
@@ -1056,45 +946,29 @@ def main() -> None:
             decoded, boxes = detect_qr(
                 frame,
                 detector,
-                use_heavy_pass=(
-                    consecutive_misses >= HEAVY_PASS_MISS_THRESHOLD
-                    and frame_count % HEAVY_PASS_INTERVAL == 0
-                ),
+                use_heavy_pass=(frame_count % HEAVY_PASS_INTERVAL == 0),
             )
-            if decoded:
-                consecutive_misses = 0
-            else:
-                consecutive_misses += 1
             for payload in decoded:
                 if stop_requested:
                     break
                 if not payload:
                     continue
                 now = time.monotonic()
+                if args.unique and payload in seen:
+                    continue
+                if payload in last_seen and now - last_seen[payload] < repeat_delay:
+                    continue
                 message = parse_protocol_payload(payload)
                 if message is None:
                     print("Ignored non-protocol QR payload.")
                     continue
-                page_id = str(message.get("g", "")).strip()
-                if page_id:
-                    if page_id in processed_page_ids:
-                        continue
-                else:
-                    if args.unique and payload in seen:
-                        continue
-                    if payload in last_seen and now - last_seen[payload] < repeat_delay:
-                        continue
+                last_seen[payload] = now
+                seen.add(payload)
                 try:
-                    status = process_protocol_message(
-                        message,
-                        args.output,
-                        transfers,
-                        completed,
-                        sessions,
-                    )
+                    status = process_protocol_message(message, args.output, transfers, completed)
                 except Exception as exc:
                     status = f"Error processing transfer frame: {exc}"
-                ready = space_sender.refresh_ready(force=True)
+                ready = space_sender.refresh_ready()
                 print(space_sender.frame_status_message())
                 if not ready:
                     continue
@@ -1110,19 +984,14 @@ def main() -> None:
                     print(space_sender.frame_status_message())
                     continue
                 beep()
-                if page_id:
-                    processed_page_ids.add(page_id)
-                else:
-                    last_seen[payload] = now
-                    seen.add(payload)
                 if status:
                     print(status)
-                # Advance at most one sender page per captured frame.
-                break
 
             frame = draw_boxes(frame, boxes)
             cv2.imshow("qr_2_file", frame)
-            cv2.waitKey(1)
+            key = cv2.waitKey(1) & 0xFF
+            if key in {27, ord("q"), ord("Q")}:
+                break
     except KeyboardInterrupt:
         print("\nStopping on Ctrl-C...")
     finally:

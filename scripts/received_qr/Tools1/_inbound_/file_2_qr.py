@@ -15,7 +15,7 @@ import zipfile
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, List, NoReturn, Optional, Sequence, Tuple
+from typing import Iterable, List, NoReturn, Optional, Sequence, Tuple
 
 try:
     import tkinter as tk
@@ -423,7 +423,6 @@ def build_data_frames(
     relative_path: str,
     encoded_payload: bytes,
     max_version: int,
-    next_page_id: Callable[[], str],
 ) -> list[bytes]:
     max_bytes = get_max_payload(max_version)
     chunk_size = max_bytes
@@ -435,7 +434,6 @@ def build_data_frames(
                 "data",
                 s=session_id,
                 f=file_id,
-                g=next_page_id(),
                 i=index,
                 n=total,
                 p=relative_path,
@@ -459,13 +457,6 @@ def build_transfer_pages(
     control_repeats: int,
 ) -> list[PageSpec]:
     page_specs: list[PageSpec] = []
-    page_index = 0
-
-    def next_page_id() -> str:
-        nonlocal page_index
-        page_index += 1
-        return f"{session_id}-{page_index:06d}"
-
     for file_index, item in enumerate(files, start=1):
         file_id = f"{file_index:04d}"
         zip_bytes = zip_single_file(item.source, item.relative_path)
@@ -476,26 +467,35 @@ def build_transfer_pages(
             item.relative_path,
             payload_bytes,
             max_version,
-            next_page_id,
         )
+        start_frame = frame_bytes(
+            "start",
+            s=session_id,
+            f=file_id,
+            p=item.relative_path,
+            e="base64",
+            c=len(data_frames),
+            o=item.source.stat().st_size,
+            z=len(zip_bytes),
+            zh=sha256_hex(zip_bytes),
+        )
+        end_frame = frame_bytes(
+            "end",
+            s=session_id,
+            f=file_id,
+            p=item.relative_path,
+            e="base64",
+            c=len(data_frames),
+            ph=sha256_hex(payload_bytes),
+            zh=sha256_hex(zip_bytes),
+        )
+        control_frames = [("START", start_frame), ("END", end_frame)]
+        for label, frame in control_frames:
+            version = choose_version(len(frame), max_version)
+            if len(frame) > get_max_payload(version):
+                fail(f"{label} frame for {item.relative_path} exceeds version {max_version}-L capacity.")
+        start_version = choose_version(len(start_frame), max_version)
         for repeat_index in range(control_repeats):
-            start_frame = frame_bytes(
-                "start",
-                s=session_id,
-                f=file_id,
-                g=next_page_id(),
-                p=item.relative_path,
-                e="base64",
-                c=len(data_frames),
-                o=item.source.stat().st_size,
-                z=len(zip_bytes),
-                zh=sha256_hex(zip_bytes),
-                ri=repeat_index + 1,
-                rc=control_repeats,
-            )
-            start_version = choose_version(len(start_frame), max_version)
-            if len(start_frame) > get_max_payload(start_version):
-                fail(f"START frame for {item.relative_path} exceeds version {max_version}-L capacity.")
             page_specs.append(
                 PageSpec(
                     payload=start_frame,
@@ -511,23 +511,8 @@ def build_transfer_pages(
                     label=f"DATA {item.relative_path} {chunk_index}/{len(data_frames)}",
                 )
             )
+        end_version = choose_version(len(end_frame), max_version)
         for repeat_index in range(control_repeats):
-            end_frame = frame_bytes(
-                "end",
-                s=session_id,
-                f=file_id,
-                g=next_page_id(),
-                p=item.relative_path,
-                e="base64",
-                c=len(data_frames),
-                ph=sha256_hex(payload_bytes),
-                zh=sha256_hex(zip_bytes),
-                ri=repeat_index + 1,
-                rc=control_repeats,
-            )
-            end_version = choose_version(len(end_frame), max_version)
-            if len(end_frame) > get_max_payload(end_version):
-                fail(f"END frame for {item.relative_path} exceeds version {max_version}-L capacity.")
             page_specs.append(
                 PageSpec(
                     payload=end_frame,
@@ -535,16 +520,9 @@ def build_transfer_pages(
                     label=f"END {item.relative_path} {repeat_index + 1}/{control_repeats}",
                 )
             )
+    session_end = frame_bytes("session_end", s=session_id, c=len(files))
+    session_end_version = choose_version(len(session_end), max_version)
     for repeat_index in range(control_repeats):
-        session_end = frame_bytes(
-            "session_end",
-            s=session_id,
-            g=next_page_id(),
-            c=len(files),
-            ri=repeat_index + 1,
-            rc=control_repeats,
-        )
-        session_end_version = choose_version(len(session_end), max_version)
         page_specs.append(
             PageSpec(
                 payload=session_end,

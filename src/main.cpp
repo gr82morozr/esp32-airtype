@@ -719,7 +719,9 @@ static void serviceConsoleStatusAcks() {
 
 #if ENABLE_KEYBOARD
   if (fileEndRequested && !fileFinishedAckSent &&
-      getInputBufferFree() == INPUT_BUFFER_SIZE) {
+      getInputBufferFree() == INPUT_BUFFER_SIZE &&
+      typedCharCount >= expectedFileTypedCount &&
+      typedCharCount >= acceptedCharCount) {
     bool sent = sendConsoleAcceptedAck(true);
     sent = sendConsoleTypedAck(true) && sent;
     sent = sendConsoleBufferFinishedAck() && sent;
@@ -1147,6 +1149,9 @@ static size_t writeKeyboardChar(char c, uint32_t abortGeneration) {
     return 0;
   }
 
+  keyboard.releaseAll();
+  taskDelayMs(1);
+
   if (c == '#') {
     keyboard.press(KEY_LEFT_SHIFT);
     taskDelayMs(SHIFTED_SYMBOL_DELAY_MS);
@@ -1156,11 +1161,16 @@ static size_t writeKeyboardChar(char c, uint32_t abortGeneration) {
     }
     size_t written = keyboard.write('3');
     taskDelayMs(SHIFTED_SYMBOL_DELAY_MS);
-    keyboard.release(KEY_LEFT_SHIFT);
+    keyboard.releaseAll();
+    taskDelayMs(1);
     return written;
   }
 
-  return keyboard.write(static_cast<uint8_t>(c));
+  size_t written = keyboard.write(static_cast<uint8_t>(c));
+  taskDelayMs(1);
+  keyboard.releaseAll();
+  taskDelayMs(1);
+  return written;
 }
 
 static void keyboardInputTask(void* parameter) {

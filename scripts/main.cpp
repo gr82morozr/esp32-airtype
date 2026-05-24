@@ -89,6 +89,10 @@ uint32_t otaBlinkStartMs = 0;
 bool timeConfigured = false;
 bool powerSaveModeActive = false;
 
+static bool asciiCharUsesShift(char c) {
+  return (c >= 'A' && c <= 'Z') || strchr("~!@#$%^&*()_+{}|:\"<>?", c) != nullptr;
+}
+
 static bool sendConsoleButtonState(bool buttonDown, bool force);
 static void closeConsoleClient(const char* reason);
 
@@ -514,7 +518,14 @@ static void handleTcpConsoleInput(bool buttonDown) {
         taskDelayMs(KEYBOARD_MIN_INTERVAL_MS - elapsed);
         now = millis();
       }
+      bool needsShift = asciiCharUsesShift(c);
       keyboard.write(static_cast<uint8_t>(c));
+      taskDelayMs(1);
+      keyboard.releaseAll();
+      if (needsShift) {
+        taskDelayMs(1);
+        keyboard.releaseAll();
+      }
       lastKeyboardSendMs = now;
     }
 #endif

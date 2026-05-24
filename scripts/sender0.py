@@ -7,13 +7,11 @@ import argparse
 import base64
 import io
 import select
-import shutil
 import signal
 import socket
 import sys
 import time
 import zipfile
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -27,27 +25,8 @@ READY_STATUS_INTERVAL = 2.0
 FINAL_ACK_TIMEOUT = 30.0
 FILE_END_CONTROL_PREFIX = b"\x1eEND "
 RATE_CONTROL_PREFIX = b"\x1eRATE "
-FILE_START_MARKER_PREFIX = "$$$LOAD-"
-FILE_START_MARKER_SUFFIX = "%%%"
-EXCLUDED_DIR_NAMES = [".git", ".gitignore", "__pycache__"]
-EXCLUDED_FILE_NAMES = [".gitignore"]
-MIN_INLINE_PROGRESS_WIDTH = 80
 ANSI_RED = "\033[31m"
 ANSI_RESET = "\033[0m"
-
-
-@dataclass(frozen=True)
-class PayloadInfo:
-  payload: bytes
-  source_bytes: int
-  zip_bytes: int
-  base64_bytes: int
-
-
-@dataclass(frozen=True)
-class TransferItem:
-  source_path: Path
-  archive_relpath: Path
 
 
 def _red(text: str) -> str:
@@ -59,27 +38,6 @@ def _pause_on_mismatch() -> None:
     input("[sender] Press Enter to exit...")
   except EOFError:
     pass
-
-
-def _terminal_width(default: int = 120) -> int:
-  try:
-    return max(MIN_INLINE_PROGRESS_WIDTH, shutil.get_terminal_size((default, 20)).columns)
-  except OSError:
-    return default
-
-
-def _emit_progress(message: str, progress_width: int) -> int:
-  inline_limit = max(40, _terminal_width() - 1)
-  if len(message) <= inline_limit:
-    progress_width = max(progress_width, len(message))
-    sys.stdout.write(f"\r{message:<{progress_width}}")
-    sys.stdout.flush()
-    return progress_width
-  if progress_width:
-    sys.stdout.write("\r" + (" " * progress_width) + "\r")
-  sys.stdout.write(message + "\n")
-  sys.stdout.flush()
-  return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -164,56 +122,24 @@ def _sleep_with_stop(duration: float, stop_flag: "StopFlag") -> None:
     time.sleep(min(0.1, remaining))
 
 
-def _build_payload(item: TransferItem) -> PayloadInfo:
-  archive_name = item.archive_relpath.as_posix()
-  source_bytes = item.source_path.stat().st_size
+def _build_payload(path: Path) -> bytes:
+  archive_name = path.name
   with io.BytesIO() as buffer:
     with zipfile.ZipFile(
         buffer, mode="w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
     ) as zf:
-      zf.writestr(archive_name, item.source_path.read_bytes())
+      zf.writestr(archive_name, path.read_bytes())
     zipped = buffer.getvalue()
   payload = base64.b64encode(zipped)
   print(
-      f"[sender] Loaded {item.source_path} as {archive_name} "
-      f"({source_bytes} bytes -> zip {len(zipped)} bytes -> "
+      f"[sender] Loaded {path} ({path.stat().st_size} bytes -> zip {len(zipped)} bytes -> "
       f"{len(payload)} base64 bytes)"
   )
-  return PayloadInfo(
-      payload=payload,
-      source_bytes=source_bytes,
-      zip_bytes=len(zipped),
-      base64_bytes=len(payload),
-  )
+  return payload
 
 
-def _marker_archive_path(item: TransferItem) -> str:
-  zip_relpath = item.archive_relpath.parent / f"{item.archive_relpath.name}.zip"
-  return zip_relpath.as_posix().replace("/", "\\")
-
-
-def _encode_marker_path(raw_path: str) -> str:
-  return base64.b64encode(raw_path.encode("utf-8")).decode("ascii")
-
-
-def _encode_marker_int(value: int) -> str:
-  return base64.b64encode(str(max(0, value)).encode("ascii")).decode("ascii")
-
-
-def _build_end_marker(item: TransferItem) -> bytes:
-  marker_path = _encode_marker_path(f"D:\\Temp\\{_marker_archive_path(item)}")
-  marker = f"@@@SAVE-{marker_path}###"
-  return marker.encode("ascii")
-
-
-def _build_start_marker(item: TransferItem, payload_info: PayloadInfo) -> bytes:
-  marker_path = _encode_marker_path(f"D:\\Temp\\{_marker_archive_path(item)}")
-  marker_source_bytes = _encode_marker_int(payload_info.source_bytes)
-  marker_payload_bytes = _encode_marker_int(payload_info.base64_bytes)
-  marker = (
-      f"{FILE_START_MARKER_PREFIX}{marker_path}!{marker_source_bytes}!{marker_payload_bytes}"
-      f"{FILE_START_MARKER_SUFFIX}"
-  )
+def _build_end_marker(path: Path) -> bytes:
+  marker = f"@@@SAVE-D:\\\\Temp\\\\{path.name}.zip###"
   return marker.encode("ascii")
 
 
@@ -226,28 +152,16 @@ def _build_rate_control(rate: float) -> bytes:
   return RATE_CONTROL_PREFIX + str(rate_cps).encode("ascii") + b"\n"
 
 
-def _expand_inputs(inputs: list[Path]) -> list[TransferItem]:
-  files: list[TransferItem] = []
+def _expand_inputs(inputs: list[Path]) -> list[Path]:
+  files: list[Path] = []
   for input_path in inputs:
     if not input_path.exists():
       sys.exit(f"[sender] Input path not found: {input_path}")
     if input_path.is_file():
-      if input_path.name in EXCLUDED_FILE_NAMES:
-        continue
-      files.append(TransferItem(source_path=input_path, archive_relpath=Path(input_path.name)))
+      files.append(input_path)
       continue
     if input_path.is_dir():
-      for path in sorted(candidate for candidate in input_path.rglob("*") if candidate.is_file()):
-        if any(part in EXCLUDED_DIR_NAMES for part in path.relative_to(input_path).parts[:-1]):
-          continue
-        if path.name in EXCLUDED_FILE_NAMES:
-          continue
-        files.append(
-            TransferItem(
-                source_path=path,
-                archive_relpath=Path(input_path.name) / path.relative_to(input_path),
-            )
-        )
+      files.extend(sorted(path for path in input_path.rglob("*") if path.is_file()))
       continue
     sys.exit(f"[sender] Unsupported input path: {input_path}")
   if not files:
@@ -363,7 +277,6 @@ def stream_forever(
     connect_timeout: float,
     payload: bytes,
     label: str,
-    batch_label: str,
     burst: int,
     start_delay: float,
     rate: float,
@@ -375,7 +288,6 @@ def stream_forever(
   rate_control = _build_rate_control(rate)
   requested_rate_cps = max(1, int(round(rate)))
   progress_width = 0
-
   while not stop_flag.is_set:
     sock: Optional[socket.socket] = None
     index = 0
@@ -511,15 +423,16 @@ def stream_forever(
           return
         if index >= total_chars:
           progress = (
-              f"[sender] {batch_label} {label} | "
-              f"tx {index}/{total_chars} | "
-              f"typed {typed_ack}/{total_chars} | "
-              f"buf {(accepted_ack / total_chars) * 100.0:5.1f}% | "
-              f"type {(typed_ack / total_chars) * 100.0:5.1f}% | "
-              f"rate {measured_typed_rate:5.0f}/{rate_ack_cps or requested_rate_cps} cps | "
-              f"wait {finished_typed}/{total_chars} {file_done_typed}/{total_chars}"
+              f"[sender] {label}: 100.00% sent, "
+              f"{(accepted_ack / total_chars) * 100.0:6.2f}% buffered, "
+              f"{(typed_ack / total_chars) * 100.0:6.2f}% typed, "
+              f"rate {measured_typed_rate:6.1f}/{rate_ack_cps or requested_rate_cps} cps, "
+              f"waiting buffer/file finish {finished_typed}/{total_chars}, "
+              f"{file_done_typed}/{total_chars}"
           )
-          progress_width = _emit_progress(progress, progress_width)
+          progress_width = max(progress_width, len(progress))
+          sys.stdout.write(f"\r{progress:<{progress_width}}")
+          sys.stdout.flush()
           _sleep_with_stop(READY_POLL_INTERVAL, stop_flag)
           continue
         if not receiver_ready:
@@ -547,13 +460,14 @@ def stream_forever(
         sock.sendall(chunk)
         percent = (index / total_chars) * 100.0
         progress = (
-            f"[sender] {batch_label} {label} | "
-            f"tx {index}/{total_chars} ({percent:5.1f}%) | "
-            f"typed {typed_ack}/{total_chars} ({(typed_ack / total_chars) * 100.0:5.1f}%) | "
-            f"buf {(accepted_ack / total_chars) * 100.0:5.1f}% | "
-            f"rate {measured_typed_rate:5.0f}/{rate_ack_cps or requested_rate_cps} cps"
+            f"\r[sender] {label}: {percent:6.2f}% sent, "
+            f"{(accepted_ack / total_chars) * 100.0:6.2f}% buffered, "
+            f"{(typed_ack / total_chars) * 100.0:6.2f}% typed, "
+            f"rate {measured_typed_rate:6.1f}/{rate_ack_cps or requested_rate_cps} cps"
         )
-        progress_width = _emit_progress(progress, progress_width)
+        progress_width = max(progress_width, len(progress) - 1)
+        sys.stdout.write(f"{progress:<{progress_width + 1}}")
+        sys.stdout.flush()
         delay = interval if interval > 0 else 0.0
         if rate > 0:
           delay = max(delay, send_count / rate)
@@ -612,20 +526,12 @@ def main() -> None:
     signal.signal(sig, handle_stop)
 
   try:
-    total_files = len(files_to_send)
-    print(f"[sender] Total files to send: {total_files}")
-    for index, item in enumerate(files_to_send, start=1):
+    for index, input_path in enumerate(files_to_send, start=1):
       if stop_flag.is_set:
         break
-      label = item.archive_relpath.as_posix()
-      batch_label = f"File {index}/{total_files}"
+      label = f"{input_path.name} ({index}/{len(files_to_send)})"
       print(f"[sender] Preparing {label}")
-      payload_info = _build_payload(item)
-      payload = (
-          _build_start_marker(item, payload_info)
-          + payload_info.payload
-          + _build_end_marker(item)
-      )
+      payload = _build_payload(input_path) + _build_end_marker(input_path)
       stream_forever(
           host=args.host,
           port=args.port,
@@ -633,7 +539,6 @@ def main() -> None:
           connect_timeout=args.connect_timeout,
           payload=payload,
           label=label,
-          batch_label=batch_label,
           burst=args.burst,
           start_delay=args.start_delay,
           rate=args.rate,
@@ -649,3 +554,4 @@ if __name__ == "__main__":
   if sys.version_info < (3, 8):
     sys.exit("Python 3.8+ is required.")
   main()
+
